@@ -6,11 +6,6 @@
 (require 's)
 (require 'ht)
 (require 'f)
-(require 'company-elisp)
-
-;; TODOs:
-;; expand common prefix when pressing tab
-;; write wrappers for existing completion gizmos (company stuff? completion at point function, pcomplete, dabbrev)
 
 (defcustom o/num-candidates 9
   "Number of candidates to display in completion window."
@@ -143,8 +138,8 @@ Otherwise make it invisible."
        (no-focus-on-map . t)
        (override-redirect . t)
        (user-size . t)
-       (width . 30)
-       (height . 15)
+       (width . 60)
+       (height . 30)
        (user-position . t)
        (left . -1)
        (top . -1)
@@ -175,6 +170,12 @@ Otherwise make it invisible."
   string
   backend-name
   context)
+(defun o/candidate->string (cand)
+  "Return the string for CAND, which could be one of many types."
+  (cond
+   ((o/candidate-p cand) (o/candidate-string cand))
+   ((stringp cand) cand)
+   (t (error "Invalid candidate: %s" cand))))
 
 (cl-defstruct (o/state (:constructor o/make-state))
   candidates ;; completion candidates being chosen from. note this should not change!
@@ -194,20 +195,30 @@ Otherwise make it invisible."
 
 (defun o/filter-prefix (prefix candidates)
   "Return CANDIDATES matching PREFIX."
-  (let ((-compare-fn (lambda (x y) (s-equals? (o/candidate-string x) (o/candidate-string y)))))
+  (let ((-compare-fn (lambda (x y) (s-equals? (o/candidate->string x) (o/candidate->string y)))))
     (-uniq
-     (--filter (s-prefix? prefix (o/candidate-string it)) candidates))))
+     (--filter
+      (when-let ((s (o/candidate->string it)))
+        (s-prefix? prefix s))
+      (-non-nil candidates)))))
 
+(cl-defun o/first-result (pred xs)
+  "Return the first non-nil PRED on XS alongside the element that yielded it."
+  (--each xs
+    (when-let ((y (funcall pred it)))
+      (cl-return-from o/first-result (cons it y)))))
 (defun o/complete-with (prefix backends)
   "Return a list of candidates matching PREFIX given the list of BACKENDS."
   (when-let*
-      ((backend
-        (--first
-         (funcall (o/backend-function it) prefix)
+      ((res
+        (o/first-result
+         (lambda (it) (funcall (o/backend-function it) prefix))
          (-map #'funcall backends)))
-       (comps (funcall (o/backend-function backend) prefix)))
+       (backend (car res))
+       (comps (cdr res)))
     (--each comps
-      (setf (o/candidate-backend-name it) (o/backend-name backend)))
+      (when (o/candidate-p it)
+        (setf (o/candidate-backend-name it) (o/backend-name backend))))
     comps))
 
 (defun o/symbol-prefix-at-point ()
@@ -250,11 +261,11 @@ INDEX is the index of the selected candidate."
               (min
                (max 0 (- len o/num-candidates))
                (max 0 (- index (/ o/num-candidates 2)))))
-             (scrolled (-drop scroll cs))
+             (scrolled (-take o/num-candidates (-drop scroll cs)))
              (sidx (- index scroll)))
         (--each-indexed scrolled
           (o/write-line
-           (o/candidate-string it)
+           (o/candidate->string it)
            (when (= it-index sidx)
              'o/highlight)))))))
 
@@ -271,7 +282,7 @@ INDEX is the index of the selected candidate."
            (idx (o/state-index o/completion))
            (selected (nth idx cands))
            (o/num-candidates (min o/num-candidates (length cands)))
-           (width (max 20 (+ 1 (-max (--map (length (o/candidate-string it)) cands)))))
+           (width (max 20 (+ 1 (-max (--map (length (o/candidate->string it)) cands)))))
            (bx (car pos))
            (by (+ (cdr pos) (if header-line-format 0 (line-pixel-height))))
            )
@@ -280,7 +291,7 @@ INDEX is the index of the selected candidate."
       (o/resize-frame o/candidates-frame width o/num-candidates)
       (o/move-frame o/candidates-frame bx by)
       (o/show-frame o/candidates-frame t)
-      (if (and selected (o/candidate-context selected))
+      (if (and selected (o/candidate-p selected) (o/candidate-context selected))
           (progn
             (o/render-context selected)
             (o/move-frame o/context-frame (+ bx (* width (default-font-width))) by)
@@ -304,7 +315,7 @@ Intended to run in `post-command-hook'."
 (defun o/common-prefix (cs)
   "Return the common prefix string of CS."
   (let*
-      ((strs (-map #'o/candidate-string cs))
+      ((strs (-map #'o/candidate->string cs))
        (s (car strs))
        (ss (cdr strs))
        (end 0)
@@ -322,8 +333,9 @@ Intended to run in `post-command-hook'."
   (when o/completion
     (when-let*
         ((prefix (funcall o/prefix-at-point-function))
-         (cs (o/complete-with (cdr prefix) o/backends)))
-      (when-let ((common (o/common-prefix cs)))
+         (cs (o/state-candidates o/completion)))
+      (when-let ((common (o/common-prefix cs))
+                 ((s-prefix? (cdr prefix) common)))
         (delete-region (o/state-start-pos o/completion) (o/state-pos o/completion))
         (goto-char (o/state-start-pos o/completion))
         (insert common)
@@ -378,7 +390,7 @@ Intended to run in `post-command-hook'."
     (when-let ((cand (seq-elt (o/state-candidates o/completion) (o/state-index o/completion))))
       (delete-region (o/state-start-pos o/completion) (o/state-pos o/completion))
       (goto-char (o/state-start-pos o/completion))
-      (insert (o/candidate-string cand))
+      (insert (o/candidate->string cand))
       (setq o/completion nil))))
 
 (defun o/helper-external-command (command &rest args)
@@ -419,6 +431,42 @@ Intended to run in `post-command-hook'."
               (substring-no-properties))))
          cands))))))
 
+(defun o/backend-eglot ()
+  "Build a new completion backend for `eglot'."
+  (o/make-backend
+   :name "eglot"
+   :function
+   (lambda (prefix)
+     (when-let*
+         ((res (eglot-completion-at-point))
+          (col (caddr res))
+          (cands
+           (cond
+            ((functionp col) (funcall col prefix nil t))
+            (t nil))))
+       (o/filter-prefix
+        prefix
+        (--map
+         (let*
+             ((props (text-properties-at 0 it))
+              (ci (plist-get props 'eglot--lsp-item))
+              (ft
+               (-some-> ci
+                 (plist-get :filterText)
+                 (or it)
+                 (substring-no-properties)))
+              (s (substring-no-properties it)))
+           (o/make-candidate
+            :string
+            (or ft s)
+            :context
+            (-some-> ci
+              (plist-get :documentation)
+              (plist-get :value)
+              (substring-no-properties)
+              (eglot--format-markup))))
+         cands))))))
+
 (defun o/backend-fish ()
   "Build a new completion backend for the Fish shell."
   (o/make-backend
@@ -433,7 +481,7 @@ Intended to run in `post-command-hook'."
           (lines (s-lines res))
           (cands (--map (s-split "\t" it) lines)))
        (--filter
-        (s-present? (o/candidate-string it))
+        (s-present? (o/candidate->string it))
         (--map
          (o/make-candidate
           :string (car it)
@@ -446,10 +494,12 @@ Intended to run in `post-command-hook'."
    :name "Emacs Lisp"
    :function
    (lambda (prefix)
-     (--map
-      (o/make-candidate
-       :string it)
-      (company-elisp-candidates prefix)))))
+     (when-let*
+         ((res (elisp-completion-at-point))
+          (col (caddr res))
+          (props (cdddr res))
+          (cands (all-completions prefix col (plist-get props :predicate))))
+       cands))))
 
 (defun o/backend-test ()
   "Test completion backend."
