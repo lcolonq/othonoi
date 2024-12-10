@@ -202,24 +202,20 @@ Otherwise make it invisible."
         (s-prefix? prefix s))
       (-non-nil candidates)))))
 
-(cl-defun o/first-result (pred xs)
-  "Return the first non-nil PRED on XS alongside the element that yielded it."
-  (--each xs
-    (when-let ((y (funcall pred it)))
-      (cl-return-from o/first-result (cons it y)))))
-(defun o/complete-with (prefix backends)
-  "Return a list of candidates matching PREFIX given the list of BACKENDS."
-  (when-let*
-      ((res
-        (o/first-result
-         (lambda (it) (funcall (o/backend-function it) prefix))
-         (-map #'funcall backends)))
-       (backend (car res))
-       (comps (cdr res)))
-    (--each comps
-      (when (o/candidate-p it)
-        (setf (o/candidate-backend-name it) (o/backend-name backend))))
-    comps))
+(defun o/complete-with (prefix backends k)
+  "Return a list of candidates matching PREFIX given the list of BACKENDS.
+Pass the result to K."
+  (when (and (car backends) (o/backend-p (car backends)))
+    (funcall
+     (o/backend-function (car backends)) prefix
+     (lambda (comps)
+       (if comps
+           (progn
+             (--each comps
+               (when (o/candidate-p it)
+                 (setf (o/candidate-backend-name it) (o/backend-name (car backends)))))
+             (funcall k comps))
+         (o/complete-with prefix (cdr backends) k))))))
 
 (defun o/symbol-prefix-at-point ()
   "Return a pair of the start position and prefix string preceding point."
@@ -345,17 +341,20 @@ Intended to run in `post-command-hook'."
   "Complete from point in the current buffer."
   (interactive)
   (when-let*
-      ((prefix (funcall o/prefix-at-point-function))
-       (cs (o/complete-with (cdr prefix) o/backends)))
-    (setq-local
-     o/completion
-     (o/make-state
-      :candidates cs
-      :start-pos (car prefix)
-      :pos (point)))
-    (if (= 1 (length cs))
-        (o/insert)
-      (o/render))))
+      ((prefix (funcall o/prefix-at-point-function)))
+    (o/complete-with
+     (cdr prefix) (-map #'funcall o/backends)
+     (lambda (cs)
+       (when cs
+         (setq-local
+          o/completion
+          (o/make-state
+           :candidates cs
+           :start-pos (car prefix)
+           :pos (point)))
+         (if (= 1 (length cs))
+             (o/insert)
+           (o/render)))))))
 
 (defun o/next ()
   "Go to the next candidate."
@@ -404,7 +403,7 @@ Intended to run in `post-command-hook'."
   (o/make-backend
    :name "LSP"
    :function
-   (lambda (prefix)
+   (lambda (prefix k)
      (when-let*
          ((res (lsp-completion-at-point))
           (col (caddr res))
@@ -412,31 +411,33 @@ Intended to run in `post-command-hook'."
            (cond
             ((functionp col) (funcall col prefix nil t))
             (t nil))))
-       (o/filter-prefix
-        prefix
-        (--map
-         (let*
-             ((props (text-properties-at 0 it))
-              (ci (plist-get props 'lsp-completion-item)))
-           (o/make-candidate
-            :string
-            (-some-> ci
-              (ht-get "filterText")
-              (or it)
-              (substring-no-properties))
-            :context
-            (-some-> ci
-              (ht-get "documentation")
-              (ht-get "value")
-              (substring-no-properties))))
-         cands))))))
+       (funcall
+        k
+        (o/filter-prefix
+         prefix
+         (--map
+          (let*
+              ((props (text-properties-at 0 it))
+               (ci (plist-get props 'lsp-completion-item)))
+            (o/make-candidate
+             :string
+             (-some-> ci
+               (ht-get "filterText")
+               (or it)
+               (substring-no-properties))
+             :context
+             (-some-> ci
+               (ht-get "documentation")
+               (ht-get "value")
+               (substring-no-properties))))
+          cands)))))))
 
 (defun o/backend-eglot ()
   "Build a new completion backend for `eglot'."
   (o/make-backend
    :name "eglot"
    :function
-   (lambda (prefix)
+   (lambda (prefix k)
      (when-let*
          ((res (eglot-completion-at-point))
           (col (caddr res))
@@ -444,36 +445,38 @@ Intended to run in `post-command-hook'."
            (cond
             ((functionp col) (funcall col prefix nil t))
             (t nil))))
-       (o/filter-prefix
-        prefix
-        (--map
-         (let*
-             ((props (text-properties-at 0 it))
-              (ci (plist-get props 'eglot--lsp-item))
-              (ft
-               (-some-> ci
-                 (plist-get :textEdit)
-                 (plist-get :newText)
-                 (or it)
-                 (substring-no-properties)))
-              (s (substring-no-properties it)))
-           (o/make-candidate
-            :string
-            (or ft s)
-            :context
-            (-some-> ci
-              (plist-get :documentation)
-              (plist-get :value)
-              (substring-no-properties)
-              (eglot--format-markup))))
-         cands))))))
+       (funcall
+        k
+        (o/filter-prefix
+         prefix
+         (--map
+          (let*
+              ((props (text-properties-at 0 it))
+               (ci (plist-get props 'eglot--lsp-item))
+               (ft
+                (-some-> ci
+                  (plist-get :textEdit)
+                  (plist-get :newText)
+                  (or it)
+                  (substring-no-properties)))
+               (s (substring-no-properties it)))
+            (o/make-candidate
+             :string
+             (or ft s)
+             :context
+             (-some-> ci
+               (plist-get :documentation)
+               (plist-get :value)
+               (substring-no-properties)
+               (eglot--format-markup))))
+          cands)))))))
 
 (defun o/backend-fish ()
   "Build a new completion backend for the Fish shell."
   (o/make-backend
    :name "Fish"
    :function
-   (lambda (prefix)
+   (lambda (prefix k)
      (when-let*
          ((res
            (o/helper-external-command
@@ -481,39 +484,43 @@ Intended to run in `post-command-hook'."
             (format "complete -C%s" (shell-quote-argument prefix))))
           (lines (s-lines res))
           (cands (--map (s-split "\t" it) lines)))
-       (--filter
-        (s-present? (o/candidate->string it))
-        (--map
-         (o/make-candidate
-          :string (car it)
-          :context (cadr it))
-         cands))))))
+       (funcall
+        k
+        (--filter
+         (s-present? (o/candidate->string it))
+         (--map
+          (o/make-candidate
+           :string (car it)
+           :context (cadr it))
+          cands)))))))
 
 (defun o/backend-elisp ()
   "Build a new completion backend for Emacs Lisp."
   (o/make-backend
    :name "Emacs Lisp"
    :function
-   (lambda (prefix)
+   (lambda (prefix k)
      (when-let*
          ((res (elisp-completion-at-point))
           (col (caddr res))
           (props (cdddr res))
           (cands (all-completions prefix col (plist-get props :predicate))))
-       cands))))
+       (funcall k cands)))))
 
 (defun o/backend-test ()
   "Test completion backend."
   (o/make-backend
    :name "Test"
    :function
-   (lambda (prefix)
-     (o/filter-prefix
-      prefix
-      (list
-       (o/make-candidate :string "foo")
-       (o/make-candidate :string "bar")
-       (o/make-candidate :string "baz"))))))
+   (lambda (prefix k)
+     (funcall
+      k
+      (o/filter-prefix
+       prefix
+       (list
+        (o/make-candidate :string "foo")
+        (o/make-candidate :string "bar")
+        (o/make-candidate :string "baz")))))))
 
 (provide 'othonoi)
 ;;; othonoi.el ends here
