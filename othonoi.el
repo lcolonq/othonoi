@@ -452,7 +452,8 @@ Intended to run in `post-command-hook'."
               (ci (plist-get props 'eglot--lsp-item))
               (ft
                (-some-> ci
-                 (plist-get :filterText)
+                 (plist-get :textEdit)
+                 (plist-get :newText)
                  (or it)
                  (substring-no-properties)))
               (s (substring-no-properties it)))
