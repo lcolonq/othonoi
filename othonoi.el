@@ -57,6 +57,7 @@ Otherwise make it invisible."
     (modify-frame-parameters
      f
      (list
+      (cons 'background-color o/background-color)
       (cons 'top y)
       (cons 'left x)))))
 (defun o/resize-frame (f w h)
@@ -65,6 +66,7 @@ Otherwise make it invisible."
     (modify-frame-parameters
      f
      (list
+      (cons 'background-color o/background-color)
       (cons 'width w)
       (cons 'height h)))))
 
